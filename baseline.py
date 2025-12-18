@@ -2,191 +2,185 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
-import numpy as np
+
+from intersection import IDMParams, SimConfig, simulate_intersection_2phase, Approach
 
 
-# -----------------------------
-# IDM (classical)
-# -----------------------------
-@dataclass
-class IDMParams:
-    v0: float = 15.0     # desired speed [m/s]
-    a: float = 1.2       # max accel [m/s^2]
-    b: float = 2.0       # comfortable decel [m/s^2]
-    T: float = 1.2       # desired time headway [s]
-    s0: float = 2.0      # minimum gap [m]
-    delta: float = 4.0   # exponent
-
-
-def idm_accel(v: float, s: float, dv: float, p: IDMParams) -> float:
+class FixedTime2PhaseSignal:
     """
-    Classical IDM acceleration.
-    v  : ego speed
-    s  : net gap to leader (meters)
-    dv : approaching rate = v - v_leader
+    Two-phase fixed-time:
+      - Phase A green for green_A seconds
+      - Phase B green for green_B seconds
+      - repeat
     """
-    s_eff = max(s, 0.1)  # avoid division by zero
-    s_star = p.s0 + v * p.T + (v * dv) / (2.0 * math.sqrt(p.a * p.b) + 1e-9)
-    return p.a * (1.0 - (v / p.v0) ** p.delta - (s_star / s_eff) ** 2)
 
+    def __init__(self, green_A: float, green_B: float, start: Approach = "A"):
+        self.green_A = float(green_A)
+        self.green_B = float(green_B)
+        self.cycle = self.green_A + self.green_B
+        self.start = start
 
-# -----------------------------
-# Traffic signal (fixed-time)
-# -----------------------------
-class FixedTimeSignal:
-    def __init__(self, green_s: float, red_s: float, start_green: bool = True):
-        self.green = float(green_s)
-        self.red = float(red_s)
-        self.cycle = self.green + self.red
-        self.start_green = start_green
-
-    def is_green(self, t: float) -> bool:
+    def green_of(self, t: float) -> Approach:
         phase = t % self.cycle
-        return phase < self.green if self.start_green else phase >= self.red
+
+        if self.start == "A":
+            return "A" if phase < self.green_A else "B"
+        else:
+            # start with B
+            return "B" if phase < self.green_B else "A"
 
 
-# -----------------------------
-# Simulation objects
-# -----------------------------
-@dataclass
-class Vehicle:
-    x: float
-    v: float
-    spawned_t: float
-    exit_t: float | None = None
-    stops: int = 0
-    moving_prev: bool = False
-    done: bool = False
-    stopped_time: float = 0.0
-
-
-@dataclass
-class SimConfig:
-    # road
-    L: float = 400.0         # spawn at x=-L, stop line at x=0
-    stop_x: float = 0.0
-    veh_len: float = 4.5
-
-    # time
-    dt: float = 0.2
-    T_end: float = 300.0
-
-    # demand
-    arrival_rate: float = 0.30  # veh/s
-    seed: int = 1
-
-    # queue / stop definitions (for later metrics)
-    queue_zone: float = 150.0
-    speed_stop_th: float = 0.5
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def poisson_spawn(rng: np.random.Generator, lam: float, dt: float) -> bool:
-    # For small dt: P(arrival) ≈ lam*dt
-    return rng.random() < lam * dt
-
-
-def compute_queue(vehicles: list[Vehicle], cfg: SimConfig) -> int:
-    q = 0
-    for veh in vehicles:
-        if veh.done:
-            continue
-        if -cfg.queue_zone <= veh.x <= cfg.stop_x and veh.v < cfg.speed_stop_th:
-            q += 1
-    return q
-
-
-def mean_speed_near(vehicles: list[Vehicle]) -> float:
-    speeds = [veh.v for veh in vehicles if (not veh.done) and (-200.0 <= veh.x <= 0.0)]
-    return float(np.mean(speeds)) if speeds else 0.0
-
-
-# -----------------------------
-# Baseline run
-# -----------------------------
-def run_baseline(cfg: SimConfig, idm_p: IDMParams, signal: FixedTimeSignal):
+def run_baseline(cfg: SimConfig, idm_p: IDMParams, signal: FixedTime2PhaseSignal):
     """
-    Baseline:
-      - Classical IDM: interaction only with the preceding vehicle
-      - Fixed-time signal control
-      - Hard stop enforced at stop line when red
-    Returns time series + vehicle list (for metrics later).
+    Baseline wrapper around the common intersection simulator.
     """
+    # We run the sim once, but the simulator needs to know green each step.
+    # Easiest: re-run inside a loop would be slow. Instead, we create a tiny closure
+    # conceptually. Here we use a trick: we step time and call simulate_intersection_2phase
+    # which expects a single constant green_of -> so we must not do that.
+    #
+    # So: we do a small adaptation: we create a phase array by sampling signal over time,
+    # then "replay" by stepping the simulator. BUT our simulator currently takes constant
+    # green_of. We'll keep it simple:
+    #
+    # => We implement fixed-time by running two sims and stitching? Not ok.
+    #
+    # Solution: For clarity and correctness, we keep the simulator constant-green
+    # and instead move the time-varying signal logic into the simulator. That would
+    # require edits.
+    #
+    # BUT we already included phase_ts inside simulator. So we should pass a function.
+    #
+    # Therefore: use the alternative function below (implemented here).
+
+    return _run_with_time_varying_green(cfg, idm_p, signal.green_of)
+
+
+# ---- Time-varying green runner (shared pattern) ----
+from typing import Callable, Dict
+import numpy as np
+from intersection import Vehicle, idm_accel, poisson_spawn, compute_queue_for_approach, mean_speed_near_for_approach, mean_speed_near_total, detected_near_stopline  # noqa
+
+
+def _run_with_time_varying_green(cfg: SimConfig, idm_p: IDMParams, green_fn: Callable[[float], Approach]) -> Dict:
+    """
+    Same dynamics as intersection.simulate_intersection_2phase, but green is time-varying.
+    Implemented as a local copy to avoid circular imports / messy architecture.
+    """
+
     rng = np.random.default_rng(cfg.seed)
     dt = cfg.dt
     times = np.arange(0.0, cfg.T_end + dt, dt)
 
     vehicles: list[Vehicle] = []
-    queue_ts = np.zeros_like(times)
-    ms_ts = np.zeros_like(times)
+
+    queue_A_ts = np.zeros_like(times)
+    queue_B_ts = np.zeros_like(times)
+    queue_tot_ts = np.zeros_like(times)
+
+    ms_A_ts = np.zeros_like(times)
+    ms_B_ts = np.zeros_like(times)
+    ms_tot_ts = np.zeros_like(times)
+
+    passed_A_ts = np.zeros_like(times)
+    passed_B_ts = np.zeros_like(times)
+
+    phase_ts = np.zeros_like(times, dtype=int)  # 0 => A green, 1 => B green
+
+    def can_spawn(approach: Approach) -> bool:
+        active = [v for v in vehicles if (not v.done) and v.approach == approach]
+        if not active:
+            return True
+        min_x = min(v.x for v in active)
+        return not (min_x < -cfg.L + 10.0)
 
     for k, t in enumerate(times):
-        green = signal.is_green(t)
+        green_of = green_fn(t)
+        green_A = green_of == "A"
+        green_B = green_of == "B"
+        phase_ts[k] = 0 if green_A else 1
 
-        # Spawn a new vehicle upstream (simple spacing check)
-        if poisson_spawn(rng, cfg.arrival_rate, dt):
-            can_spawn = True
-            active = [v for v in vehicles if not v.done]
-            if active:
-                min_x = min(v.x for v in active)
-                if min_x < -cfg.L + 10.0:
-                    can_spawn = False
-            if can_spawn:
-                vehicles.append(Vehicle(x=-cfg.L, v=0.0, spawned_t=t))
+        # spawn
+        if poisson_spawn(rng, cfg.arrival_rate_A, dt) and can_spawn("A"):
+            vehicles.append(Vehicle(x=-cfg.L, v=0.0, spawned_t=t, approach="A"))
+        if poisson_spawn(rng, cfg.arrival_rate_B, dt) and can_spawn("B"):
+            vehicles.append(Vehicle(x=-cfg.L, v=0.0, spawned_t=t, approach="B"))
 
-        # Update vehicles: closest to stop line first
-        active_idx = [i for i, v in enumerate(vehicles) if not v.done]
-        active_idx.sort(key=lambda i: vehicles[i].x, reverse=True)
+        # update each approach
+        for approach, is_green in (("A", green_A), ("B", green_B)):
+            active_idx = [i for i, v in enumerate(vehicles) if (not v.done) and v.approach == approach]
+            active_idx.sort(key=lambda i: vehicles[i].x, reverse=True)
 
-        for pos, i in enumerate(active_idx):
-            ego = vehicles[i]
+            for pos, i in enumerate(active_idx):
+                ego = vehicles[i]
 
-            # Gap to preceding vehicle
-            if pos == 0:
-                s_veh = 1e9
-                dv = 0.0
-            else:
-                lead = vehicles[active_idx[pos - 1]]
-                s_veh = (lead.x - ego.x) - cfg.veh_len
-                dv = ego.v - lead.v
+                # vehicle leader constraint
+                if pos == 0:
+                    s_veh = 1e9
+                    dv_veh = 0.0
+                else:
+                    lead = vehicles[active_idx[pos - 1]]
+                    s_veh = (lead.x - ego.x) - cfg.veh_len
+                    dv_veh = ego.v - lead.v
 
-            acc = idm_accel(ego.v, s_veh, dv, idm_p)
+                # stop line constraint on red
+                if not is_green:
+                    s_sig = (cfg.stop_x - ego.x) - cfg.veh_len
+                    dv_sig = ego.v
+                else:
+                    s_sig = 1e9
+                    dv_sig = 0.0
 
-            # Euler integration
-            v_new = max(0.0, ego.v + acc * dt)
-            x_new = ego.x + v_new * dt
+                if s_sig < s_veh:
+                    s_eff, dv_eff = s_sig, dv_sig
+                else:
+                    s_eff, dv_eff = s_veh, dv_veh
 
-            # Hard stop at stop line on red
-            if not green and x_new > -0.5:
-                x_new = -0.5
-                v_new = 0.0
+                acc = idm_accel(ego.v, s_eff, dv_eff, idm_p)
 
-            # Accumulate stopped time near stop line (proxy)
-            if -cfg.queue_zone <= x_new <= cfg.stop_x and v_new < cfg.speed_stop_th and not ego.done:
-                ego.stopped_time += dt
+                v_new = max(0.0, ego.v + acc * dt)
+                x_new = ego.x + v_new * dt
 
-            # Count stops (moving -> stopped transition)
-            moving_now = v_new > cfg.speed_stop_th
-            if ego.moving_prev and not moving_now:
-                ego.stops += 1
-            ego.moving_prev = moving_now
+                if not is_green and x_new > -0.5:
+                    x_new = -0.5
+                    v_new = 0.0
 
-            # Exit when crossing stop line on green
-            if green and x_new >= cfg.stop_x:
-                ego.done = True
-                ego.exit_t = t
+                if (-cfg.queue_zone <= x_new <= cfg.stop_x) and (v_new < cfg.speed_stop_th) and (not ego.done):
+                    ego.stopped_time += dt
 
-            ego.x, ego.v = x_new, v_new
+                moving_now = v_new > cfg.speed_stop_th
+                if ego.moving_prev and not moving_now:
+                    ego.stops += 1
+                ego.moving_prev = moving_now
 
-        queue_ts[k] = compute_queue(vehicles, cfg)
-        ms_ts[k] = mean_speed_near(vehicles)
+                if is_green and x_new >= cfg.stop_x:
+                    ego.done = True
+                    ego.exit_t = t
+                    if approach == "A":
+                        passed_A_ts[k] += 1
+                    else:
+                        passed_B_ts[k] += 1
+
+                ego.x, ego.v = x_new, v_new
+
+        queue_A_ts[k] = compute_queue_for_approach(vehicles, cfg, "A")
+        queue_B_ts[k] = compute_queue_for_approach(vehicles, cfg, "B")
+        queue_tot_ts[k] = queue_A_ts[k] + queue_B_ts[k]
+
+        ms_A_ts[k] = mean_speed_near_for_approach(vehicles, cfg, "A")
+        ms_B_ts[k] = mean_speed_near_for_approach(vehicles, cfg, "B")
+        ms_tot_ts[k] = mean_speed_near_total(vehicles, cfg)
 
     return {
         "t": times,
-        "queue": queue_ts,
-        "mean_speed": ms_ts,
+        "phase": phase_ts,
+        "queue_A": queue_A_ts,
+        "queue_B": queue_B_ts,
+        "queue_total": queue_tot_ts,
+        "mean_speed_A": ms_A_ts,
+        "mean_speed_B": ms_B_ts,
+        "mean_speed_total": ms_tot_ts,
+        "passed_A_ts": passed_A_ts,
+        "passed_B_ts": passed_B_ts,
         "vehicles": vehicles,
     }
