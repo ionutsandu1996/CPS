@@ -3,214 +3,245 @@ from __future__ import annotations
 
 import numpy as np
 
-from intersection import (
+from baseline import (
     IDMParams,
+    Vehicle,
     SimConfig,
-    Approach,
-    detected_near_stopline,
+    poisson_spawn,
+    can_spawn_vehicle,
+    compute_queue,
+    mean_speed_near,
+    idm_accel,
 )
 
-from baseline import _run_with_time_varying_green
 
-
-class ActuatedGapOut2PhaseSignal:
+# -----------------------------
+# CPS: Actuated traffic signal (gap-out)
+# -----------------------------
+class ActuatedGapOutSignal:
     """
-    2-phase actuated control (A/B) with gap-out termination.
+    Actuated control with gap-out termination (single approach demo).
 
-    We keep one phase green at a time. Switching happens when:
-      - minimum green satisfied AND
-      - (gap-out: no detection for gap_threshold) OR max green reached
+    Parameters:
+      G_min         minimum green time [s]
+      G_max         maximum green time [s]
+      R_min         minimum red time [s]
+      gap_threshold if no vehicle is detected for this long during GREEN,
+                    the signal ends green (after G_min) [s]
 
-    Note:
-    - This is a minimal “realistic” actuated controller, not SCOOT/SCATS.
+    State variables:
+      phase         "GREEN" or "RED"
+      phase_t       elapsed time in current phase
+      last_detect_t last time a vehicle was detected during GREEN
     """
 
-    def __init__(
-        self,
-        G_min: float = 10.0,
-        G_max: float = 45.0,
-        gap_threshold: float = 2.0,
-        start: Approach = "A",
-    ):
+    def __init__(self, G_min=10.0, G_max=45.0, R_min=10.0, gap_threshold=2.0):
         self.G_min = float(G_min)
         self.G_max = float(G_max)
+        self.R_min = float(R_min)
         self.gap = float(gap_threshold)
 
-        self.phase: Approach = start
-        self.phase_t: float = 0.0
-        self.last_detect_t: float = 0.0
+        self.phase = "GREEN"
+        self.phase_t = 0.0
+        self.last_detect_t = 0.0
 
-    def step(self, t: float, dt: float, detected_current: bool) -> Approach:
+    def step(self, t: float, dt: float, detected: bool) -> bool:
+        """
+        Advances controller state by dt and returns True if GREEN, False if RED.
+        """
         self.phase_t += dt
 
-        if detected_current:
-            self.last_detect_t = t
+        if self.phase == "GREEN":
+            # update last detection time if detector sees a vehicle
+            if detected:
+                self.last_detect_t = t
 
-        # enforce minimum green
-        if self.phase_t < self.G_min:
-            return self.phase
+            # enforce minimum green
+            if self.phase_t < self.G_min:
+                return True
 
-        # max green
-        if self.phase_t >= self.G_max:
-            self._switch(t)
-            return self.phase
+            # prevent over-long green
+            if self.phase_t >= self.G_max:
+                self.phase = "RED"
+                self.phase_t = 0.0
+                return False
 
-        # gap-out
-        if (t - self.last_detect_t) >= self.gap:
-            self._switch(t)
-            return self.phase
+            # gap-out: no vehicle detected recently => end green
+            if (t - self.last_detect_t) >= self.gap:
+                self.phase = "RED"
+                self.phase_t = 0.0
+                return False
 
-        return self.phase
+            return True
 
-    def _switch(self, t: float):
-        self.phase = "B" if self.phase == "A" else "A"
+        # RED phase
+        if self.phase_t < self.R_min:
+            return False
+
+        # after minimum red, go green again (single-approach demo)
+        self.phase = "GREEN"
         self.phase_t = 0.0
-        self.last_detect_t = t  # avoid immediate gap-out on new phase
+        # reset detection to "now" to avoid immediate gap-out
+        self.last_detect_t = t
+        return True
 
 
-def run_proposed(cfg: SimConfig, idm_p: IDMParams, signal: ActuatedGapOut2PhaseSignal):
+# -----------------------------
+# CPS: Detector model (infrastructure sensing)
+# -----------------------------
+def detected_near_stopline(
+    vehicles: list[Vehicle],
+    cfg: SimConfig,
+    detect_zone: float = 25.0,
+) -> bool:
     """
-    Proposed wrapper (actuated gap-out) using same intersection dynamics as baseline.
+    Returns True if any active vehicle is within `detect_zone` meters upstream
+    of the stop line. This mimics a simple loop detector / camera presence zone.
+
+    detect_zone = 25m means "detector covers last 25 meters before x=0".
     """
+    for veh in vehicles:
+        if veh.done:
+            continue
+
+        dist_to_stop = cfg.stop_x - veh.x
+        if 0.0 <= dist_to_stop <= detect_zone:
+            return True
+
+    return False
+
+
+# -----------------------------
+# Proposed simulation (IDM + CPS traffic signal)
+# -----------------------------
+def run_proposed(
+    cfg: SimConfig,
+    idm_p: IDMParams,
+    signal: ActuatedGapOutSignal,
+    detect_zone: float = 25.0,
+):
+    """
+    Proposed:
+      - Vehicles still follow IDM (human drivers).
+      - CPS loop: detector -> controller -> signal phase (GREEN/RED).
+      - When signal is RED, stop line acts as a "virtual leader" constraint, so IDM
+        uses the most restrictive gap:
+            s_eff = min( gap_to_leader_vehicle, gap_to_stopline_if_red )
+
+    Returns time series + vehicle list (for metrics later).
+    """
+    rng = np.random.default_rng(cfg.seed)
     dt = cfg.dt
     times = np.arange(0.0, cfg.T_end + dt, dt)
 
-    # We'll create a green_fn(t) by simulating the controller internally.
-    phase_over_time: list[Approach] = []
-
-    # Reset controller state for this run
-    # (in case user reuses same instance across seeds)
-    signal.phase_t = 0.0
-    signal.last_detect_t = 0.0
-
-    # We need a “preview” run to generate green decisions? That would be wrong because
-    # detection depends on vehicles. So we do it properly:
-    # - We run the simulation step-by-step inside _run_with_time_varying_green? not possible.
-    #
-    # Practical minimal solution:
-    # - We embed the controller into green_fn by keeping a tiny state and querying detection
-    #   from the currently-updating sim. But _run_with_time_varying_green doesn't expose vehicles.
-    #
-    # Therefore: we implement a custom run loop here that mirrors _run_with_time_varying_green,
-    # but adds detection->controller->green.
-    #
-    # This keeps fairness: same physics, only green logic differs.
-
-    from intersection import Vehicle, idm_accel, poisson_spawn, compute_queue_for_approach, mean_speed_near_for_approach, mean_speed_near_total
-
-    rng = np.random.default_rng(cfg.seed)
-
     vehicles: list[Vehicle] = []
-
-    queue_A_ts = np.zeros_like(times)
-    queue_B_ts = np.zeros_like(times)
-    queue_tot_ts = np.zeros_like(times)
-
-    ms_A_ts = np.zeros_like(times)
-    ms_B_ts = np.zeros_like(times)
-    ms_tot_ts = np.zeros_like(times)
-
-    passed_A_ts = np.zeros_like(times)
-    passed_B_ts = np.zeros_like(times)
-
-    phase_ts = np.zeros_like(times, dtype=int)  # 0 A green, 1 B green
-
-    def can_spawn(approach: Approach) -> bool:
-        active = [v for v in vehicles if (not v.done) and v.approach == approach]
-        if not active:
-            return True
-        min_x = min(v.x for v in active)
-        return not (min_x < -cfg.L + 10.0)
+    queue_ts = np.zeros_like(times)
+    ms_ts = np.zeros_like(times)
 
     for k, t in enumerate(times):
-        # detector for CURRENT phase only
-        detected = detected_near_stopline(vehicles, cfg, signal.phase)
+        # -----------------------------
+        # CPS: sensing -> control -> actuation
+        # -----------------------------
+        detected = detected_near_stopline(vehicles, cfg, detect_zone)
+        green = signal.step(t, dt, detected)
 
-        # controller decides who is green now
-        green_of = signal.step(t, cfg.dt, detected)
-        green_A = green_of == "A"
-        green_B = green_of == "B"
-        phase_ts[k] = 0 if green_A else 1
+        # -----------------------------
+        # Spawn vehicles upstream (same as baseline)
+        # -----------------------------
+        if poisson_spawn(rng, cfg.arrival_rate, dt) and can_spawn_vehicle(vehicles, cfg):
+            vehicles.append(Vehicle(x=-cfg.L, v=0.0, spawned_t=t))
 
-        # spawn
-        if poisson_spawn(rng, cfg.arrival_rate_A, cfg.dt) and can_spawn("A"):
-            vehicles.append(Vehicle(x=-cfg.L, v=0.0, spawned_t=t, approach="A"))
-        if poisson_spawn(rng, cfg.arrival_rate_B, cfg.dt) and can_spawn("B"):
-            vehicles.append(Vehicle(x=-cfg.L, v=0.0, spawned_t=t, approach="B"))
+        # -----------------------------
+        # Update vehicles: closest to stop line first
+        # -----------------------------
+        active_idx = [i for i, v in enumerate(vehicles) if not v.done]
+        active_idx.sort(key=lambda i: vehicles[i].x, reverse=True)
 
-        # update each approach
-        for approach, is_green in (("A", green_A), ("B", green_B)):
-            active_idx = [i for i, v in enumerate(vehicles) if (not v.done) and v.approach == approach]
-            active_idx.sort(key=lambda i: vehicles[i].x, reverse=True)
+        for pos, i in enumerate(active_idx):
+            ego = vehicles[i]
 
-            for pos, i in enumerate(active_idx):
-                ego = vehicles[i]
+            # (1) constraint from preceding vehicle
+            if pos == 0:
+                s_veh = 1e9
+                dv_veh = 0.0
+            else:
+                lead = vehicles[active_idx[pos - 1]]
+                s_veh = (lead.x - ego.x) - cfg.veh_len
+                dv_veh = ego.v - lead.v
 
-                if pos == 0:
-                    s_veh = 1e9
-                    dv_veh = 0.0
-                else:
-                    lead = vehicles[active_idx[pos - 1]]
-                    s_veh = (lead.x - ego.x) - cfg.veh_len
-                    dv_veh = ego.v - lead.v
+            # (2) constraint from stop line if RED (virtual leader)
+            if not green:
+                s_sig = (cfg.stop_x - ego.x) - cfg.veh_len
+                dv_sig = ego.v  # "leader" is stationary at stop line
+            else:
+                s_sig = 1e9
+                dv_sig = 0.0
 
-                if not is_green:
-                    s_sig = (cfg.stop_x - ego.x) - cfg.veh_len
-                    dv_sig = ego.v
-                else:
-                    s_sig = 1e9
-                    dv_sig = 0.0
+            # (3) choose most restrictive constraint
+            if s_sig < s_veh:
+                s_eff, dv_eff = s_sig, dv_sig
+            else:
+                s_eff, dv_eff = s_veh, dv_veh
 
-                if s_sig < s_veh:
-                    s_eff, dv_eff = s_sig, dv_sig
-                else:
-                    s_eff, dv_eff = s_veh, dv_veh
+            # IDM accel with effective constraint
+            acc = idm_accel(ego.v, s_eff, dv_eff, idm_p)
 
-                acc = idm_accel(ego.v, s_eff, dv_eff, idm_p)
+            # Euler integration
+            v_new = max(0.0, ego.v + acc * dt)
+            x_new = ego.x + v_new * dt
 
-                v_new = max(0.0, ego.v + acc * cfg.dt)
-                x_new = ego.x + v_new * cfg.dt
+            # Physical enforcement: cannot cross stop line on RED
+            if not green and x_new > -0.5:
+                x_new = -0.5
+                v_new = 0.0
 
-                if not is_green and x_new > -0.5:
-                    x_new = -0.5
-                    v_new = 0.0
+            # stopped time near stop line
+            if -cfg.queue_zone <= x_new <= cfg.stop_x and v_new < cfg.speed_stop_th and not ego.done:
+                ego.stopped_time += dt
 
-                if (-cfg.queue_zone <= x_new <= cfg.stop_x) and (v_new < cfg.speed_stop_th) and (not ego.done):
-                    ego.stopped_time += cfg.dt
+            # stops count
+            moving_now = v_new > cfg.speed_stop_th
+            if ego.moving_prev and not moving_now:
+                ego.stops += 1
+            ego.moving_prev = moving_now
 
-                moving_now = v_new > cfg.speed_stop_th
-                if ego.moving_prev and not moving_now:
-                    ego.stops += 1
-                ego.moving_prev = moving_now
+            # Exit when crossing stop line on GREEN
+            if green and x_new >= cfg.stop_x:
+                ego.done = True
+                ego.exit_t = t
 
-                if is_green and x_new >= cfg.stop_x:
-                    ego.done = True
-                    ego.exit_t = t
-                    if approach == "A":
-                        passed_A_ts[k] += 1
-                    else:
-                        passed_B_ts[k] += 1
+            ego.x, ego.v = x_new, v_new
 
-                ego.x, ego.v = x_new, v_new
-
-        queue_A_ts[k] = compute_queue_for_approach(vehicles, cfg, "A")
-        queue_B_ts[k] = compute_queue_for_approach(vehicles, cfg, "B")
-        queue_tot_ts[k] = queue_A_ts[k] + queue_B_ts[k]
-
-        ms_A_ts[k] = mean_speed_near_for_approach(vehicles, cfg, "A")
-        ms_B_ts[k] = mean_speed_near_for_approach(vehicles, cfg, "B")
-        ms_tot_ts[k] = mean_speed_near_total(vehicles, cfg)
+        # -----------------------------
+        # time-series logging
+        # -----------------------------
+        queue_ts[k] = compute_queue(vehicles, cfg)
+        ms_ts[k] = mean_speed_near(vehicles, cfg)
 
     return {
         "t": times,
-        "phase": phase_ts,
-        "queue_A": queue_A_ts,
-        "queue_B": queue_B_ts,
-        "queue_total": queue_tot_ts,
-        "mean_speed_A": ms_A_ts,
-        "mean_speed_B": ms_B_ts,
-        "mean_speed_total": ms_tot_ts,
-        "passed_A_ts": passed_A_ts,
-        "passed_B_ts": passed_B_ts,
+        "queue": queue_ts,
+        "mean_speed": ms_ts,
         "vehicles": vehicles,
     }
+
+
+# Optional sanity check
+if __name__ == "__main__":
+    from baseline import FixedTimeSignal, run_baseline
+
+    cfg = SimConfig(arrival_rate=0.60, seed=1, T_end=120.0, queue_zone=150.0)
+    idm_p = IDMParams()
+
+    # Baseline (for quick side-by-side)
+    base_sig = FixedTimeSignal(green_s=20.0, red_s=30.0, start_green=True)
+    out_b = run_baseline(cfg, idm_p, base_sig)
+
+    # Proposed
+    prop_sig = ActuatedGapOutSignal(G_min=10.0, G_max=45.0, R_min=10.0, gap_threshold=2.0)
+    out_p = run_proposed(cfg, idm_p, prop_sig, detect_zone=25.0)
+
+    thr_b = sum(v.exit_t is not None for v in out_b["vehicles"])
+    thr_p = sum(v.exit_t is not None for v in out_p["vehicles"])
+    print("proposed.py OK")
+    print("Throughput baseline:", thr_b, "Throughput proposed:", thr_p)
