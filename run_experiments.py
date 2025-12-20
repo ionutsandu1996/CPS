@@ -114,9 +114,9 @@ def main():
     # ------------------
     # Realistic experiment settings (single-lane, heavy traffic)
     # ------------------
-    arrival_rate = 0.40     # veh/s  (~1440 veh/h) => heavy / rush-like for one lane
+    arrival_rate = 0.6     # veh/s  (~1440 veh/h) => heavy / rush-like for one lane
     seeds = [1, 2, 3, 4, 5]
-    T_end = 1800.0          # 30 minutes
+    T_end = 2400.0          # 40 minutes
 
     # Baseline signal timings (realistic-ish urban cycle ~75s)
     fixed_green = 30.0
@@ -130,7 +130,7 @@ def main():
     detect_zone = 30.0
 
     # Measurement definitions (what counts as "queue" and "near intersection")
-    queue_zone = 150.0
+    queue_zone = 300.0
     speed_zone = 200.0
 
     # ------------------
@@ -187,6 +187,35 @@ def main():
     print("Generated: runs.csv, summary.csv")
     print("Generated: queue_over_time.png, mean_speed.png")
     print("Generated: metric_bars_delay.png, metric_bars_queue.png, metric_bars_throughput.png")
+        # ------------------
+    # Print run parameters (for reproducibility)
+    # ------------------
+    print("\n=== RUN PARAMETERS ===")
+
+    # IDM parameters
+    print("IDMParams:")
+    for k, v in vars(idm_p).items():
+        print(f"  {k} = {v}")
+
+    # Config parameters (use the last cfg, or store a representative one)
+    print("\nSimConfig:")
+    for k, v in vars(cfg).items():
+        print(f"  {k} = {v}")
+
+    # Signal params
+    print("\nBaseline Fixed-Time Signal:")
+    print(f"  green_s = {fixed_green}")
+    print(f"  red_s   = {fixed_red}")
+
+    print("\nProposed Actuated Gap-Out Signal:")
+    print(f"  G_min         = {G_min}")
+    print(f"  G_max         = {G_max}")
+    print(f"  R_min         = {R_min}")
+    print(f"  gap_threshold = {gap_threshold}")
+    print(f"  detect_zone   = {detect_zone}")
+
+    print("======================\n")
+
 
 
 if __name__ == "__main__":

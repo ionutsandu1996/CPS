@@ -74,7 +74,7 @@ class Vehicle:
 @dataclass
 class SimConfig:
     # road geometry
-    L: float = 400.0         # spawn at x = -L
+    L: float = 1000.0         # spawn at x = -L
     stop_x: float = 0.0      # stop line at x = 0
     veh_len: float = 4.5
 
