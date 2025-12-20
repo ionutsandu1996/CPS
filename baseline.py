@@ -83,7 +83,7 @@ class SimConfig:
     T_end: float = 900.0
 
     # demand
-    arrival_rate: float = 0.30   # veh/s
+    arrival_rate: float = 0.40   # veh/s
     seed: int = 1
 
     # measurement / definitions
